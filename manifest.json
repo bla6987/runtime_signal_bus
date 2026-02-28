@@ -1,0 +1,12 @@
+{
+    "display_name": "Runtime Signal Bus",
+    "loading_order": 0,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "User",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false
+}
