@@ -2,7 +2,7 @@
     'use strict';
 
     const EXTENSION_NAME = 'runtime_signal_bus';
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
 
     const CONTEXT_POLL_INTERVAL_MS = 100;
     const CONTEXT_TIMEOUT_MS = 15000;
@@ -363,22 +363,24 @@
     }
 
     function ensureFetchWrapped() {
-        if (state.fetchWrapped && globalThis.window?.fetch === state.wrappedFetch) return;
-        if (state.fetchWrapped && globalThis.window?.fetch !== state.wrappedFetch) {
-            state.fetchWrapped = false;
-            state.previousFetch = null;
-            state.wrappedFetch = null;
-        }
+        // A later extension may wrap our installed function. Keep that chain:
+        // wrapping it again would run our observers twice or recurse through a
+        // mutable previousFetch. New registrations use the existing live map.
+        if (state.fetchWrapped && state.wrappedFetch) return;
         if (typeof globalThis.window?.fetch !== 'function') {
             throw new Error('window.fetch is unavailable');
         }
 
-        state.previousFetch = globalThis.window.fetch.bind(globalThis.window);
+        const previousFetch = globalThis.window.fetch.bind(globalThis.window);
+        state.previousFetch = previousFetch;
 
         const wrappedFetch = async function (target, options) {
+            // An outer extension can still hold an old wrapper after teardown.
+            // Such wrappers become transparent and keep their own stable base.
+            if (state.wrappedFetch !== wrappedFetch || !state.fetchWrapped) return previousFetch(target, options);
             const interceptors = sortInterceptors();
             if (!interceptors.length) {
-                return state.previousFetch(target, options);
+                return previousFetch(target, options);
             }
 
             const reqCtx = {
@@ -389,8 +391,31 @@
                 perfTs: safePerformanceNow(),
                 meta: {},
                 shortCircuitResponse: null,
-                baseFetch: (nextTarget, nextOptions) => state.previousFetch(nextTarget, nextOptions),
+                baseFetch: (nextTarget, nextOptions) => previousFetch(nextTarget, nextOptions),
             };
+            // Optional v1.1 API: one read-only parse per body during request hooks.
+            // Do not clone/read Request bodies: that would consume or tee a stream.
+            let parsedBody;
+            let parsedJson = null;
+            let hasParsedBody = false;
+            const releaseRequestJson = () => {
+                parsedBody = undefined;
+                parsedJson = null;
+                hasParsedBody = false;
+            };
+            reqCtx.getRequestJson = () => {
+                const body = reqCtx.options?.body;
+                if (!hasParsedBody || body !== parsedBody) {
+                    releaseRequestJson();
+                    parsedBody = body;
+                    hasParsedBody = true;
+                    if (typeof body === 'string') {
+                        try { parsedJson = JSON.parse(body); } catch { /* non-JSON */ }
+                    }
+                }
+                return parsedJson;
+            };
+            reqCtx.releaseRequestJson = releaseRequestJson;
 
             let resCtx = null;
             try {
@@ -416,9 +441,12 @@
                 }
                 reqCtx.url = resolveRequestUrl(reqCtx.target);
 
+                // Consumers retain compact metadata, not the parsed prompt. The
+                // cache need not survive a potentially minutes-long generation.
+                releaseRequestJson();
                 const response = reqCtx.shortCircuitResponse
                     ? await Promise.resolve(reqCtx.shortCircuitResponse)
-                    : await state.previousFetch(reqCtx.target, reqCtx.options);
+                    : await previousFetch(reqCtx.target, reqCtx.options);
 
                 resCtx = {
                     request: reqCtx,
@@ -467,6 +495,8 @@
                 }
 
                 throw error;
+            } finally {
+                releaseRequestJson();
             }
         };
 
@@ -487,10 +517,6 @@
         state.wrappedFetch = wrappedFetch;
         state.fetchWrapped = true;
 
-        state.destroyers.push(() => {
-            state.fetchInterceptors.clear();
-            maybeUnwrapFetch();
-        });
     }
 
     function maybeUnwrapFetch() {
@@ -683,6 +709,10 @@
 
     destroyPreviousBusIfPresent();
     bindViewportListeners();
+    state.destroyers.push(() => {
+        state.fetchInterceptors.clear();
+        maybeUnwrapFetch();
+    });
 
     globalThis.window.STRuntimeBus = {
         version: VERSION,
@@ -698,6 +728,7 @@
         fetch: {
             registerInterceptor: fetchRegisterInterceptor,
             getChainInfo: fetchGetChainInfo,
+            preservesOuterWrappers: true,
         },
         scheduler: {
             coalesce: schedulerCoalesce,
