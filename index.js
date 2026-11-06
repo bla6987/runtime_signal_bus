@@ -30,10 +30,15 @@
         contextPollTimer: null,
         contextWaiters: [],
         viewportLast: null,
+        layoutBaseline: null,
+        keyboardBaseline: null,
+        viewportRaf: null,
+        destroyed: false,
         viewportRafPending: false,
         viewportSubscribers: new Set(),
         eventSubscriptions: new Map(),
         fetchInterceptors: new Map(),
+        orderedFetchInterceptors: null,
         fetchRegistrationSeq: 0,
         fetchWrapped: false,
         previousFetch: null,
@@ -172,10 +177,12 @@
     function getViewportStateWithDiff() {
         const current = getViewportSnapshot();
         const prev = state.viewportLast;
-        const widthDelta = prev ? Math.abs(current.width - prev.width) : 0;
-        const heightDelta = prev ? Math.abs(current.height - prev.height) : 0;
+        const layout = state.layoutBaseline || prev;
+        const keyboard = state.keyboardBaseline || prev;
+        const widthDelta = prev ? Math.abs(current.width - layout.width) : 0;
+        const heightDelta = prev ? Math.abs(current.height - keyboard.height) : 0;
         const visualDelta = prev && prev.visualHeight != null && current.visualHeight != null
-            ? Math.abs(current.visualHeight - prev.visualHeight)
+            ? Math.abs(current.visualHeight - keyboard.visualHeight)
             : 0;
 
         current.widthChanged = widthDelta >= VIEWPORT_LAYOUT_THRESHOLD_PX;
@@ -183,12 +190,15 @@
         current.keyboardStateChanged = prev ? current.keyboardOpenLikely !== prev.keyboardOpenLikely : false;
         current.visualHeightChanged = visualDelta >= VIEWPORT_HEIGHT_THRESHOLD_PX;
 
+        if (current.widthChanged) state.layoutBaseline = current;
+        if (current.heightChanged || current.visualHeightChanged || current.keyboardStateChanged) state.keyboardBaseline = current;
         state.viewportLast = current;
         return current;
     }
 
     function flushViewportSignals() {
         state.viewportRafPending = false;
+        if (state.destroyed) return;
         if (!state.viewportSubscribers.size) return;
 
         const payload = getViewportStateWithDiff();
@@ -207,9 +217,9 @@
     }
 
     function queueViewportFlush() {
-        if (state.viewportRafPending) return;
+        if (state.viewportRafPending || !state.viewportSubscribers.size) return;
         state.viewportRafPending = true;
-        requestAnimationFrame(flushViewportSignals);
+        state.viewportRaf = requestAnimationFrame(flushViewportSignals);
     }
 
     function bindViewportListeners() {
@@ -228,6 +238,7 @@
         }
 
         state.viewportLast = getViewportSnapshot();
+        state.layoutBaseline = state.keyboardBaseline = state.viewportLast;
     }
 
     function viewportGetState() {
@@ -256,12 +267,13 @@
         };
     }
 
-    function emitEventToHandlers(eventKey, args) {
+    async function emitEventToHandlers(eventKey, args) {
         const entry = state.eventSubscriptions.get(eventKey);
         if (!entry) return;
+        if (eventKey === 'APP_READY') entry.replayArgs = args;
         for (const handler of [...entry.handlers]) {
             try {
-                handler(...args);
+                await handler(...args);
             } catch (error) {
                 console.error(`[${EXTENSION_NAME}] event handler error`, eventKey, error);
             }
@@ -340,6 +352,9 @@
 
         const entry = state.eventSubscriptions.get(eventKey);
         entry.handlers.add(handler);
+        if (eventKey === 'APP_READY' && entry.replayArgs) {
+            Promise.resolve().then(() => { if (entry.handlers.has(handler)) return handler(...entry.replayArgs); }).catch(error => console.error(`[${EXTENSION_NAME}] replay error`, error));
+        }
         if (!entry.attached) {
             void ensureEventBinding(eventKey);
         }
@@ -355,11 +370,15 @@
         };
     }
 
-    function sortInterceptors() {
-        return [...state.fetchInterceptors.values()].sort((a, b) => {
-            if (a.priority !== b.priority) return a.priority - b.priority;
-            return a.seq - b.seq;
-        });
+    // Rebuilt, never mutated: an in-flight fetch keeps iterating the list it started with.
+    function getOrderedInterceptors() {
+        if (!state.orderedFetchInterceptors) {
+            state.orderedFetchInterceptors = [...state.fetchInterceptors.values()].sort((a, b) => {
+                if (a.priority !== b.priority) return a.priority - b.priority;
+                return a.seq - b.seq;
+            });
+        }
+        return state.orderedFetchInterceptors;
     }
 
     function ensureFetchWrapped() {
@@ -378,7 +397,7 @@
             // An outer extension can still hold an old wrapper after teardown.
             // Such wrappers become transparent and keep their own stable base.
             if (state.wrappedFetch !== wrappedFetch || !state.fetchWrapped) return previousFetch(target, options);
-            const interceptors = sortInterceptors();
+            const interceptors = getOrderedInterceptors();
             if (!interceptors.length) {
                 return previousFetch(target, options);
             }
@@ -554,15 +573,18 @@
         };
 
         state.fetchInterceptors.set(id, interceptor);
+        state.orderedFetchInterceptors = null;
 
         return () => {
+            if (state.fetchInterceptors.get(id) !== interceptor) return;
             state.fetchInterceptors.delete(id);
+            state.orderedFetchInterceptors = null;
             maybeUnwrapFetch();
         };
     }
 
     function fetchGetChainInfo() {
-        const interceptorIds = sortInterceptors().map(x => x.id);
+        const interceptorIds = getOrderedInterceptors().map(x => x.id);
         return {
             installed: state.fetchWrapped,
             interceptorIds,
@@ -587,7 +609,7 @@
                 }
                 return counts;
             })(),
-            fetchInterceptorIds: sortInterceptors().map(x => x.id),
+            fetchInterceptorIds: getOrderedInterceptors().map(x => x.id),
             fetchWrapped: state.fetchWrapped,
         };
     }
@@ -629,7 +651,10 @@
         }
         let rafId = null;
         let latestArgs = [];
+        const cancel = () => { if (rafId != null) cancelAnimationFrame(rafId); rafId = null; latestArgs = []; };
+        state.destroyers.push(cancel);
         return (...args) => {
+            if (state.destroyed) return;
             latestArgs = args;
             if (rafId != null) return;
             rafId = requestAnimationFrame(() => {
@@ -651,16 +676,22 @@
                 if (!node) return;
                 observer.disconnect();
                 if (timerId) clearTimeout(timerId);
+                forget();
                 resolve(node);
             });
 
+            const destroyWaiter = () => { observer.disconnect(); clearTimeout(timerId); reject(Object.assign(new Error('Runtime bus destroyed'), { code: 'BUS_DESTROYED' })); };
+            state.destroyers.push(destroyWaiter);
+            const forget = () => { const index = state.destroyers.indexOf(destroyWaiter); if (index >= 0) state.destroyers.splice(index, 1); };
             observer.observe(root === document ? document.documentElement : root, {
+                attributes: true,
                 childList: true,
                 subtree: true,
             });
 
             const timerId = setTimeout(() => {
                 observer.disconnect();
+                forget();
                 reject(Object.assign(new Error(`Timed out waiting for selector: ${selector}`), { code: 'WAIT_TIMEOUT' }));
             }, Math.max(50, timeoutMs));
         });
@@ -677,6 +708,8 @@
     }
 
     function destroy() {
+        state.destroyed = true;
+        if (state.viewportRaf != null) cancelAnimationFrame(state.viewportRaf);
         if (state.contextPollTimer) {
             clearInterval(state.contextPollTimer);
             state.contextPollTimer = null;
@@ -699,6 +732,7 @@
             entry.boundEventSource = null;
         }
         state.fetchInterceptors.clear();
+        state.orderedFetchInterceptors = null;
         state.fetchRegistrationSeq = 0;
         for (const rafId of state.schedulerByKey.values()) {
             cancelAnimationFrame(rafId);
@@ -711,6 +745,7 @@
     bindViewportListeners();
     state.destroyers.push(() => {
         state.fetchInterceptors.clear();
+        state.orderedFetchInterceptors = null;
         maybeUnwrapFetch();
     });
 
